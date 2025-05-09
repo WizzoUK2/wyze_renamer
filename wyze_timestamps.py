@@ -6,6 +6,7 @@ import logging
 import csv
 import cv2
 from pathlib import Path
+from datetime import datetime
 
 # Constants
 TESSERACT_CMD = 'tesseract'
@@ -14,6 +15,7 @@ FFMPEG_TIMEOUT = 10
 BAK_LOG = "failed_ocr.bak"
 CSV_LOG = "timestamp_map.csv"
 FAILED_FRAME_DIR = "failed_frames"
+OCR_DUMP_DIR = "ocr_dumps"
 
 # Counters
 results = {
@@ -24,8 +26,9 @@ results = {
     "partial_time_only": 0
 }
 
-# Prepare logs and folders
+# Setup
 os.makedirs(FAILED_FRAME_DIR, exist_ok=True)
+os.makedirs(OCR_DUMP_DIR, exist_ok=True)
 open(BAK_LOG, 'w').close()
 open(CSV_LOG, 'w').close()
 
@@ -46,7 +49,7 @@ def preprocess_image(image_path):
     cv2.imwrite(processed_path, denoised)
     return processed_path
 
-def extract_timestamp(image_path, fallback_name=None):
+def extract_timestamp(image_path, fallback_name=None, mod_datetime=None, use_mtime_fallback=False):
     processed_path = preprocess_image(image_path)
 
     try:
@@ -71,6 +74,11 @@ def extract_timestamp(image_path, fallback_name=None):
         logging.debug(f"OCR output: {repr(text)}")
         text = re.sub(r'[\r\n]+', ' ', text)
 
+        # Save OCR dump
+        if fallback_name:
+            with open(os.path.join(OCR_DUMP_DIR, f"{fallback_name}.txt"), 'w') as dump_file:
+                dump_file.write(text)
+
         match = re.search(r'(\d{4})[-/: ]?(\d{2})[-/: ]?(\d{2})[ :T]?(\d{2})[: ]?(\d{2})[: ]?(\d{2})', text)
         if match:
             year = int(match.group(1))
@@ -84,9 +92,14 @@ def extract_timestamp(image_path, fallback_name=None):
             else:
                 logging.warning(f"Unrealistic year in OCR: {year}")
 
+        # Time-only match
         time_only = re.search(r'(\d{2})[: ]?(\d{2})[: ]?(\d{2})', text)
-        if time_only:
+        if time_only and use_mtime_fallback and mod_datetime:
             results["partial_time_only"] += 1
+            fallback_ts = f"{mod_datetime.date()} {time_only.group(1)}:{time_only.group(2)}:{time_only.group(3)}"
+            logging.info(f"Using mod-time fallback: {fallback_ts}")
+            return fallback_ts
+        elif time_only:
             logging.warning("Only time found, no date: " + time_only.group(0))
     except Exception as e:
         logging.error(f"OCR processing failed: {e}")
@@ -113,21 +126,29 @@ def extract_frame(video_path, output_path, offset):
         logging.error(f"FFmpeg timed out extracting frame at {offset}s from {video_path}")
         return False
 
-def rename_video(video_path, dry_run=False, frame_depth=1.5):
+def rename_video(video_path, dry_run=False, frame_depth=1.5, use_mtime_fallback=False):
     results["examined"] += 1
     video_path = Path(video_path)
 
     frame_offsets = [round(x * 0.5, 1) for x in range(int(frame_depth / 0.5) + 1)]
+    mod_time = datetime.fromtimestamp(video_path.stat().st_mtime)
+    timestamp_found = None
 
     for offset in frame_offsets:
         frame_path = video_path.parent / f'frame_{int(offset*10)}.jpg'
         if not extract_frame(video_path, frame_path, offset):
             continue
 
-        timestamp = extract_timestamp(frame_path, fallback_name=video_path.stem)
+        timestamp = extract_timestamp(
+            frame_path,
+            fallback_name=video_path.stem + f"_t{int(offset*10)}",
+            mod_datetime=mod_time,
+            use_mtime_fallback=use_mtime_fallback
+        )
         frame_path.unlink(missing_ok=True)
 
         if timestamp:
+            timestamp_found = timestamp
             formatted = timestamp.replace(':', '-').replace(' ', '_')
             new_path = video_path.with_name(f"{formatted}{video_path.suffix}")
 
@@ -147,17 +168,23 @@ def rename_video(video_path, dry_run=False, frame_depth=1.5):
                     results["failed"] += 1
             return
 
-    logging.warning(f"Failed to find timestamp for {video_path}")
-    with open(BAK_LOG, 'a') as bakfile:
-        bakfile.write(str(video_path) + '\n')
-    results["failed"] += 1
+    if not timestamp_found:
+        logging.warning(f"Failed to find timestamp for {video_path}")
+        with open(BAK_LOG, 'a') as bakfile:
+            bakfile.write(str(video_path) + '\n')
+        results["failed"] += 1
 
-def process_directory(start_path, dry_run=False, frame_depth=1.5):
+def process_directory(start_path, dry_run=False, frame_depth=1.5, use_mtime_fallback=False):
     logging.info(f"Scanning folder: {start_path}")
     for root, _, files in os.walk(start_path):
         for file in files:
             if file.lower().endswith(".mp4"):
-                rename_video(os.path.join(root, file), dry_run=dry_run, frame_depth=frame_depth)
+                rename_video(
+                    os.path.join(root, file),
+                    dry_run=dry_run,
+                    frame_depth=frame_depth,
+                    use_mtime_fallback=use_mtime_fallback
+                )
 
     logging.info("---------- SUMMARY ----------")
     logging.info(f"Total files examined: {results['examined']}")
@@ -178,16 +205,22 @@ def setup_logging(verbose: bool):
     )
 
 def main():
-    parser = argparse.ArgumentParser(description="Wyze Video Timestamp Renamer v3.4 (Deep Frame Sampling)")
+    parser = argparse.ArgumentParser(description="Wyze Video Timestamp Renamer v3.5")
     parser.add_argument("start_path", help="Directory to scan")
     parser.add_argument("--dry-run", action="store_true", help="Simulate file renaming")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     parser.add_argument("--frame-depth", type=float, default=1.5, help="Max seconds into video to sample frames (default: 1.5)")
+    parser.add_argument("--use-mtime-fallback", action="store_true", help="Use file mod time when only time is found in OCR")
     args = parser.parse_args()
 
     setup_logging(args.verbose)
-    process_directory(args.start_path, dry_run=args.dry_run, frame_depth=args.frame_depth)
+    process_directory(
+        args.start_path,
+        dry_run=args.dry_run,
+        frame_depth=args.frame_depth,
+        use_mtime_fallback=args.use_mtime_fallback
+    )
 
-if __name__ == "__main__":
-    main()
+main()
+
 
